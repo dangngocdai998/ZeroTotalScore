@@ -4,6 +4,11 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using UnityEngine;
+using UnityEngine.AddressableAssets;
+using UnityEngine.AddressableAssets.ResourceLocators;
+using UnityEngine.ResourceManagement.AsyncOperations;
+using UnityEngine.ResourceManagement.ResourceProviders;
+using UnityEngine.SceneManagement;
 using UnityEngine.Networking;
 
 public sealed class CCDManager : MonoBehaviour
@@ -29,6 +34,7 @@ public sealed class CCDManager : MonoBehaviour
     public event Action<string, byte[]> DownloadCompleted;
     public event Action<string, string> RequestFailed;
     public event Action<CCDUpdateInfo> UpdateChecked;
+    public event Action<float> BucketDownloadProgress;
 
     public string BaseUrl => baseUrl;
     public string ProjectId => projectId;
@@ -66,6 +72,19 @@ public sealed class CCDManager : MonoBehaviour
         bucketId = newBucketId;
         environmentId = newEnvironmentId;
         accessToken = newAccessToken;
+    }
+
+    public Coroutine DownloadBucketAndOpenScene(string bucketLabel, string sceneKey, Action onSuccess = null, Action<string> onError = null)
+    {
+        if (string.IsNullOrWhiteSpace(bucketLabel) || string.IsNullOrWhiteSpace(sceneKey))
+            return Fail("CCD bucket label and scene key are required.", onError);
+
+        return StartCoroutine(DownloadBucketAndOpenSceneRoutine(bucketLabel, sceneKey, onSuccess, onError));
+    }
+
+    public Coroutine DownloadMode1IOS(Action onSuccess = null, Action<string> onError = null)
+    {
+        return DownloadBucketAndOpenScene("Mode1", "Mode1", onSuccess, onError);
     }
 
     public Coroutine ListReleases(Action<CCDReleaseList> onSuccess, Action<string> onError = null)
@@ -167,6 +186,85 @@ public sealed class CCDManager : MonoBehaviour
         RemoveFromCache(path);
     }
 
+    private IEnumerator DownloadBucketAndOpenSceneRoutine(string bucketLabel, string sceneKey, Action onSuccess, Action<string> onError)
+    {
+        AsyncOperationHandle initialization = Addressables.InitializeAsync(false);
+        yield return initialization;
+        if (initialization.Status != AsyncOperationStatus.Succeeded)
+        {
+            NotifyFailure(bucketLabel, "Addressables initialization failed.", onError);
+            Addressables.Release(initialization);
+            yield break;
+        }
+
+        AsyncOperationHandle<List<string>> catalogs = Addressables.CheckForCatalogUpdates(false);
+        yield return catalogs;
+        if (catalogs.Status != AsyncOperationStatus.Succeeded)
+        {
+            NotifyFailure(bucketLabel, "Could not check for CCD catalog updates.", onError);
+            Addressables.Release(catalogs);
+            Addressables.Release(initialization);
+            yield break;
+        }
+
+        if (catalogs.Result != null && catalogs.Result.Count > 0)
+        {
+            AsyncOperationHandle<List<IResourceLocator>> update = Addressables.UpdateCatalogs(catalogs.Result, false);
+            yield return update;
+            if (update.Status != AsyncOperationStatus.Succeeded)
+            {
+                NotifyFailure(bucketLabel, "Could not update the CCD catalog.", onError);
+                Addressables.Release(update);
+                Addressables.Release(catalogs);
+                Addressables.Release(initialization);
+                yield break;
+            }
+            Addressables.Release(update);
+        }
+        Addressables.Release(catalogs);
+
+        AsyncOperationHandle<long> size = Addressables.GetDownloadSizeAsync(bucketLabel);
+        yield return size;
+        if (size.Status != AsyncOperationStatus.Succeeded)
+        {
+            NotifyFailure(bucketLabel, "Could not calculate CCD download size.", onError);
+            Addressables.Release(size);
+            Addressables.Release(initialization);
+            yield break;
+        }
+
+        AsyncOperationHandle download = Addressables.DownloadDependenciesAsync(bucketLabel, false);
+        while (!download.IsDone)
+        {
+            BucketDownloadProgress?.Invoke(download.PercentComplete);
+            yield return null;
+        }
+        BucketDownloadProgress?.Invoke(1f);
+        if (download.Status != AsyncOperationStatus.Succeeded)
+        {
+            NotifyFailure(bucketLabel, "Could not download CCD bucket dependencies.", onError);
+            Addressables.Release(download);
+            Addressables.Release(size);
+            Addressables.Release(initialization);
+            yield break;
+        }
+        Addressables.Release(download);
+        Addressables.Release(size);
+
+        AsyncOperationHandle<SceneInstance> scene = Addressables.LoadSceneAsync(sceneKey, LoadSceneMode.Single, true);
+        yield return scene;
+        if (scene.Status != AsyncOperationStatus.Succeeded)
+        {
+            NotifyFailure(sceneKey, "Could not load the CCD scene. Check its Addressable address.", onError);
+            Addressables.Release(scene);
+            Addressables.Release(initialization);
+            yield break;
+        }
+
+        Addressables.Release(initialization);
+        onSuccess?.Invoke();
+    }
+
     private IEnumerator DownloadRoutine(string path, Action<byte[]> onSuccess, Action<string> onError)
     {
         string key = CacheKey(path);
@@ -192,7 +290,7 @@ public sealed class CCDManager : MonoBehaviour
             yield break;
         }
 
-        string url = ContentUrl(key);
+        string url = ContentUrl(NormalizePath(path));
         string error = null;
         for (int attempt = 0; attempt <= Mathf.Max(0, maxRetries); attempt++)
         {
